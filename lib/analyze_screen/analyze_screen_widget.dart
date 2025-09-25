@@ -1,6 +1,5 @@
 import 'dart:io';
 
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:deep_fake_detection/home_screen/home_screen_widget.dart';
 import 'package:deep_fake_detection/index.dart';
@@ -25,7 +24,6 @@ import 'package:uuid/uuid.dart';
 import 'package:chewie/chewie.dart';
 export 'analyze_screen_model.dart';
 
-
 class AnalyzeScreenWidget extends StatefulWidget {
   const AnalyzeScreenWidget({super.key});
 
@@ -34,8 +32,6 @@ class AnalyzeScreenWidget extends StatefulWidget {
 
   @override
   State<AnalyzeScreenWidget> createState() => _AnalyzeScreenWidgetState();
-
-
 }
 
 class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
@@ -47,8 +43,13 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
   bool _isAnalyzing = false;
   String? _analyzeError;
   final scaffoldKey = GlobalKey<ScaffoldState>();
+  final _apiBase = 'http://10.0.2.2:8000';
+  /// Rotations (1 = 90°, 2 = 180°, 3 = 270°)
+  int _framesQuarterTurns = 0;
+  int _facesQuarterTurns = 0;
 
-
+  void _rotateFrames() => setState(() => _framesQuarterTurns = (_framesQuarterTurns + 1) % 4);
+  void _rotateFaces()  => setState(() => _facesQuarterTurns = (_facesQuarterTurns + 1) % 4);
 
   @override
   void initState() {
@@ -63,22 +64,114 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
     _chewieController?.dispose();
     super.dispose();
   }
+  Future<void> _signSelectedVideo() async {
+    if (_selectedVideo == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Sélectionne une vidéo d’abord.")),
+      );
+      return;
+    }
+    try {
+      final uri = Uri.parse("$_apiBase/integrity/sign");
+      final req = http.MultipartRequest('POST', uri)
+        ..files.add(await http.MultipartFile.fromPath('file', _selectedVideo!.path));
+
+      final res = await req.send();
+      final body = await res.stream.bytesToString();
+      final decoded = jsonDecode(body);
+
+      if (res.statusCode != 200 || decoded['signature_base64'] == null) {
+        throw Exception(decoded['error'] ?? 'Signature échouée');
+      }
+
+      final sigB64 = decoded['signature_base64'] as String;
+      final shaHex = decoded['sha256_hex'] as String?;
+
+      // Sauvegarde la signature dans un fichier .sig pour partage/archivage
+      final dir = await getTemporaryDirectory();
+      final base = _selectedVideo!.path.split('/').last;
+      final sigFile = File('${dir.path}/$base.sig');
+      await sigFile.writeAsString(sigB64);
+
+      // Option : stocker aussi dans Firestore / historique
+      // (ex: meta['integrity'] = {'sha256': shaHex, 'signature_b64': sigB64})
+      // À toi de décider si tu veux persister ici.
+
+      await Share.shareXFiles([XFile(sigFile.path)],
+          text: "Signature RSA (base64) pour $base\nSHA-256: $shaHex");
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Vidéo signée. SHA-256: ${shaHex ?? '-'}")),
+      );
+    } catch (e) {
+      await showErrorDialog(context, "Erreur de signature : $e");
+    }
+  }
+
+  Future<void> _verifySelectedVideoWithSig() async {
+    if (_selectedVideo == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Sélectionne une vidéo d’abord.")),
+      );
+      return;
+    }
+    try {
+      // 1) Choisir un fichier .sig (ou .txt) contenant la base64
+      final pick = await FilePicker.platform.pickFiles(
+        type: FileType.custom, allowedExtensions: ['sig','txt'],
+      );
+      if (pick == null || pick.files.single.path == null) return;
+
+      final sigB64 = await File(pick.files.single.path!).readAsString();
+
+      // 2) Appel API
+      final uri = Uri.parse("$_apiBase/integrity/verify");
+      final req = http.MultipartRequest('POST', uri)
+        ..fields['signature_base64'] = sigB64.trim()
+        ..files.add(await http.MultipartFile.fromPath('file', _selectedVideo!.path));
+
+      final res = await req.send();
+      final body = await res.stream.bytesToString();
+      final decoded = jsonDecode(body);
+
+      if (res.statusCode != 200) {
+        throw Exception(decoded['error'] ?? 'Vérification échouée');
+      }
+
+      final valid = decoded['valid'] == true;
+      final shaHex = decoded['sha256_hex'] as String?;
+
+      await showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: Row(
+            children: [
+              Icon(valid ? Icons.verified : Icons.error_outline,
+                  color: valid ? Colors.green : Colors.red),
+              const SizedBox(width: 8),
+              Text(valid ? "Signature valide" : "Signature invalide"),
+            ],
+          ),
+          content: Text("SHA-256: ${shaHex ?? '-'}"),
+          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK"))],
+        ),
+      );
+    } catch (e) {
+      await showErrorDialog(context, "Erreur de vérification : $e");
+    }
+  }
 
   Future<void> _pickVideo() async {
     final picked = await FilePicker.platform.pickFiles(type: FileType.video);
     if (picked != null && picked.files.single.path != null) {
       final file = File(picked.files.single.path!);
 
-      // Libère les anciens controllers
       _videoController?.dispose();
       _chewieController?.dispose();
 
-      // Crée un nouveau controller vidéo
       final controller = VideoPlayerController.file(file);
       await controller.initialize();
 
-
-      // Crée ChewieController
       final chewie = ChewieController(
         videoPlayerController: controller,
         autoPlay: false,
@@ -114,7 +207,6 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
         : 0.0;
     final analyzedAt = DateTime.now();
 
-    // Traite et complète les URLs
     List framesForDisplay = (_result?['frames_for_display'] ?? []).map((frame) {
       if (frame['url'] != null && !frame['url'].toString().startsWith('http')) {
         frame['url'] = 'http://10.0.2.2:8000${frame['url']}';
@@ -153,19 +245,14 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
     }
   }
 
-
-
-
-
-
   Future<void> _exportCsvForSplitFrames() async {
     if (_selectedVideo == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("No video to export.")),
+        const SnackBar(content: Text("No video to export.")),
       );
       return;
     }
-    var uri = Uri.parse('http://10.0.2.2:8000/predict_csv/'); // Adapter si besoin
+    var uri = Uri.parse('http://10.0.2.2:8000/predict_csv/');
     var request = http.MultipartRequest('POST', uri);
     request.files.add(await http.MultipartFile.fromPath('file', _selectedVideo!.path));
     var response = await request.send();
@@ -174,7 +261,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
 
     if (decoded['frames_csv'] == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("CSV export failed: no frames_csv.")),
+        const SnackBar(content: Text("CSV export failed: no frames_csv.")),
       );
       return;
     }
@@ -195,17 +282,15 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
 
     await Share.shareXFiles([XFile(file.path)], text: "Split frames export");
   }
-  Widget _buildMetadataWidget(dynamic metadata) {
-    if (metadata == null) return Text("No metadata extracted.");
 
+  Widget _buildMetadataWidget(dynamic metadata) {
+    if (metadata == null) return const Text("No metadata extracted.");
     Widget _metaLine(String label, dynamic value, {bool bold = false}) {
-      if (value == null || value.toString().trim().isEmpty) return SizedBox.shrink();
+      if (value == null || value.toString().trim().isEmpty) return const SizedBox.shrink();
       return Padding(
         padding: const EdgeInsets.only(bottom: 4.0),
-        child: Text(
-          "$label: $value",
-          style: bold ? const TextStyle(fontWeight: FontWeight.bold) : null,
-        ),
+        child: Text("$label: $value",
+            style: bold ? const TextStyle(fontWeight: FontWeight.bold) : null),
       );
     }
 
@@ -237,12 +322,9 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
         _metaLine("Device Model", metadata["device_model"]),
         _metaLine("Device Software", metadata["device_software"]),
         _metaLine("Encoder", metadata["encoder"]),
-        // etc
       ],
     );
   }
-
-
 
   Future<void> showErrorDialog(BuildContext context, String message) async {
     return showDialog<void>(
@@ -261,9 +343,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
           actions: <Widget>[
             TextButton(
               child: Text('OK', style: TextStyle(color: Theme.of(context).primaryColor)),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              onPressed: () => Navigator.of(context).pop(),
             ),
           ],
         );
@@ -292,11 +372,8 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
         await showDialog(
           context: context,
           builder: (context) => AlertDialog(
-            title: Center(
-              child: Text(
-                "Limit reached",
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
+            title: const Center(
+              child: Text("Limit reached", style: TextStyle(fontWeight: FontWeight.bold)),
             ),
             content: const Text(
               "You have already saved 10 analyses.\n\nPlease delete one to analyze a new video.",
@@ -304,10 +381,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
             ),
             actionsAlignment: MainAxisAlignment.center,
             actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text("OK"),
-              ),
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK")),
             ],
           ),
         );
@@ -320,7 +394,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
       _result = null;
     });
 
-    var uri = Uri.parse('http://10.0.2.2:8000/predict/'); // Adapter selon config réseau
+    var uri = Uri.parse('http://10.0.2.2:8000/predict/');
     var request = http.MultipartRequest('POST', uri);
     request.files.add(await http.MultipartFile.fromPath('file', _selectedVideo!.path));
     var response = await request.send();
@@ -333,12 +407,14 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
       _isAnalyzing = false;
     });
     await _saveAnalysisToHistory();
-
   }
-
 
   @override
   Widget build(BuildContext context) {
+    String _absUrl(dynamic u) {
+      final s = (u ?? '').toString();
+      return s.isEmpty ? '' : (s.startsWith('http') ? s : 'http://10.0.2.2:8000$s');
+    }
     return Scaffold(
       appBar: AppBar(
         title: RichText(
@@ -346,10 +422,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
             text: "Deepfake ",
             style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 22),
             children: [
-              TextSpan(
-                text: "Detection",
-                style: TextStyle(fontWeight: FontWeight.normal, color: Colors.grey[900]),
-              ),
+              TextSpan(text: "Detection", style: TextStyle(fontWeight: FontWeight.normal, color: Colors.grey[900])),
             ],
           ),
         ),
@@ -358,7 +431,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
         elevation: 1,
       ),
       body: Container(
-        decoration: BoxDecoration(
+        decoration: const BoxDecoration(
           gradient: LinearGradient(
             colors: [Color(0xFFF7E6FF), Color(0xFFF7F9FC)],
             begin: Alignment.topLeft,
@@ -377,13 +450,15 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(22),
-                    boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 16, offset: Offset(0, 6))],
+                    boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 16, offset: Offset(0, 6))],
                   ),
                   child: Padding(
                     padding: const EdgeInsets.all(14),
                     child: Column(
                       children: [
-                        if (_selectedVideo != null && _chewieController != null && _chewieController!.videoPlayerController.value.isInitialized)
+                        if (_selectedVideo != null &&
+                            _chewieController != null &&
+                            _chewieController!.videoPlayerController.value.isInitialized)
                           AspectRatio(
                             aspectRatio: _chewieController!.videoPlayerController.value.aspectRatio,
                             child: Chewie(controller: _chewieController!),
@@ -395,54 +470,49 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Image.asset('assets/images/analyze.png', height: 70), // <-- Mets ton png ici
-                                SizedBox(height: 15),
-                                Text("Choose a video to start the analysis", style: TextStyle(color: Colors.grey[600], fontSize: 16)),
+                                Image.asset('assets/images/analyze.png', height: 70),
+                                const SizedBox(height: 15),
+                                Text("Choose a video to start the analysis",
+                                    style: TextStyle(color: Colors.grey[600], fontSize: 16)),
                               ],
                             ),
                           ),
                         const SizedBox(height: 10),
 
-                        // Progress bar pendant l'analyse
                         if (_isAnalyzing) ...[
-                          SizedBox(height: 5),
+                          const SizedBox(height: 5),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
+                            children: const [
                               SizedBox(
-                                height: 28,
-                                width: 28,
+                                height: 28, width: 28,
                                 child: CircularProgressIndicator(
                                   valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF8E44AD)),
                                   strokeWidth: 3.2,
                                 ),
                               ),
                               SizedBox(width: 16),
-                              Text(
-                                "Analysis in progress...",
-                                style: TextStyle(
-                                  color: Color(0xFF8E44AD),
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 15,
-                                ),
-                              ),
+                              Text("Analysis in progress...",
+                                  style: TextStyle(color: Color(0xFF8E44AD), fontWeight: FontWeight.bold, fontSize: 15)),
                             ],
                           ),
-                          SizedBox(height: 8),
+                          const SizedBox(height: 8),
                         ],
 
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
+                        Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 12,
+                          runSpacing: 10,
                           children: [
                             ElevatedButton.icon(
                               onPressed: _pickVideo,
-                              icon: Icon(Icons.video_library),
-                              label: Text("Choose a video"),
+                              icon: const Icon(Icons.video_library),
+                              label: const Text("Choose a video"),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: Colors.grey[200],
                                 foregroundColor: Colors.black87,
                                 padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 12),
-                                textStyle: TextStyle(fontWeight: FontWeight.bold),
+                                textStyle: const TextStyle(fontWeight: FontWeight.bold),
                                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
                                 elevation: 0,
                               ),
@@ -450,17 +520,45 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                             const SizedBox(width: 18),
                             ElevatedButton.icon(
                               onPressed: _isAnalyzing || _selectedVideo == null ? null : _analyze,
-                              icon: Icon(Icons.psychology_outlined),
-                              label: _isAnalyzing ? Text("Analyzing...") : Text("Analyze"),
+                              icon: const Icon(Icons.psychology_outlined),
+                              label: _isAnalyzing ? const Text("Analyzing...") : const Text("Analyze"),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: const Color(0xFF8E44AD),
                                 foregroundColor: Colors.white,
                                 padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 24),
-                                textStyle: TextStyle(fontWeight: FontWeight.bold),
+                                textStyle: const TextStyle(fontWeight: FontWeight.bold),
                                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
                                 elevation: 2,
                                 disabledBackgroundColor: Colors.grey[300],
                                 disabledForegroundColor: Colors.grey[600],
+                              ),
+                            ),
+                            const SizedBox(width: 18),
+
+                            ElevatedButton.icon(
+                              onPressed: _selectedVideo == null ? null : _signSelectedVideo,
+                              icon: const Icon(Icons.verified_outlined),
+                              label: const Text("Sign"),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.teal[600],
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 18),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
+                              ),
+                            ),
+
+                            const SizedBox(width: 12),
+
+                            // --- AJOUT : Vérifier
+                            ElevatedButton.icon(
+                              onPressed: _selectedVideo == null ? null : _verifySelectedVideoWithSig,
+                              icon: const Icon(Icons.fact_check_outlined),
+                              label: const Text("Verify"),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.indigo[600],
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 18),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
                               ),
                             ),
                           ],
@@ -480,83 +578,134 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                       Row(
                         children: [
                           Image.asset('assets/images/frame.png', height: 24),
-                          SizedBox(width: 7),
-                          Text("Frames Split", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                          const SizedBox(width: 7),
+                          const Text("Frames Split", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                          const Spacer(),
+                          Tooltip(
+                            message: 'Rotate frames (90°)',
+                            child: InkWell(
+                              onTap: _rotateFrames,
+                              borderRadius: BorderRadius.circular(20),
+                              child: Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(16),
+                                  boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 6)],
+                                ),
+                                child: const Icon(Icons.rotate_90_degrees_ccw, size: 18, color: Color(0xFF8E44AD)),
+                              ),
+                            ),
+                          ),
                         ],
                       ),
-                      SizedBox(height: 12),
+                      const SizedBox(height: 12),
                       SizedBox(
-                        height: 135,
+                        // hauteur dynamique selon rotation (impair = 90°/270°)
+                        height: (_framesQuarterTurns % 2 == 1) ? 170 : 155,
                         child: ListView.separated(
                           scrollDirection: Axis.horizontal,
                           itemCount: _result!['frames_for_display'].length,
+                          separatorBuilder: (_, __) => const SizedBox(width: 8),
                           itemBuilder: (context, idx) {
                             final frameObj = _result!['frames_for_display'][idx];
-                            final frameUrl = "http://10.0.2.2:8000${frameObj['url']}";
+                            final frameUrl = _absUrl(frameObj['url']);
                             final frameIndex = frameObj['frame_index'];
                             final confidence = frameObj['confidence'];
                             final label = frameObj['label'];
                             final frameTime = frameObj['frame_time_sec'];
-                            return Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                GestureDetector(
-                                  onTap: () {
-                                    showDialog(
-                                      context: context,
-                                      builder: (_) => Dialog(
-                                        backgroundColor: Colors.transparent,
-                                        child: InteractiveViewer(
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.circular(12),
+
+                            return SizedBox(
+                              width: 120, // laisse un peu plus de place au texte
+                              child: Builder(
+                                builder: (context) {
+                                  final isOdd = (_framesQuarterTurns % 2) == 1;
+                                  final thumbW = isOdd ? 80.0 : 100.0;
+                                  final thumbH = isOdd ? 100.0 : 80.0;
+
+                                  return Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      GestureDetector(
+                                        onTap: () {
+                                          showDialog(
+                                            context: context,
+                                            builder: (_) => Dialog(
+                                              backgroundColor: Colors.transparent,
+                                              child: InteractiveViewer(
+                                                child: ClipRRect(
+                                                  borderRadius: BorderRadius.circular(12),
+                                                  child: RotatedBox(
+                                                    quarterTurns: _framesQuarterTurns,
+                                                    child: Image.network(
+                                                      frameUrl,
+                                                      fit: BoxFit.contain,
+                                                      gaplessPlayback: true,
+                                                      errorBuilder: (context, error, stack) => Container(
+                                                        color: Colors.grey[300],
+                                                        width: 350,
+                                                        height: 350,
+                                                        child: Icon(Icons.broken_image, size: 80, color: Colors.grey[700]),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(10),
+                                          child: RotatedBox(
+                                            quarterTurns: _framesQuarterTurns,
                                             child: Image.network(
                                               frameUrl,
-                                              fit: BoxFit.contain,
+                                              width: thumbW,
+                                              height: thumbH,
+                                              fit: BoxFit.cover,
+                                              gaplessPlayback: true,
                                               errorBuilder: (context, error, stack) => Container(
+                                                width: thumbW,
+                                                height: thumbH,
                                                 color: Colors.grey[300],
-                                                width: 350,
-                                                height: 350,
-                                                child: Icon(Icons.broken_image, size: 80, color: Colors.grey[700]),
+                                                child: Icon(Icons.broken_image, color: Colors.grey[700]),
                                               ),
                                             ),
                                           ),
                                         ),
                                       ),
-                                    );
-                                  },
-                                  child: ClipRRect(
-                                    borderRadius: BorderRadius.circular(10),
-                                    child: Image.network(
-                                      frameUrl,
-                                      width: 100,
-                                      height: 85,
-                                      fit: BoxFit.cover,
-                                      errorBuilder: (context, error, stack) => Container(
-                                        width: 100,
-                                        height: 85,
-                                        color: Colors.grey[300],
-                                        child: Icon(Icons.broken_image, color: Colors.grey[700]),
+                                      const SizedBox(height: 6),
+                                      Flexible(
+                                        child: Text(
+                                          "Frame $frameIndex — $label",
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(fontSize: 12, color: Colors.grey[800], fontWeight: FontWeight.w600),
+                                        ),
                                       ),
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(height: 3),
-                                Text(
-                                  "Frame $frameIndex — $label",
-                                  style: TextStyle(fontSize: 12, color: Colors.grey[800], fontWeight: FontWeight.w600),
-                                ),
-                                Text(
-                                  frameTime != null ? "Time: ${frameTime.toStringAsFixed(2)} s" : "",
-                                  style: TextStyle(fontSize: 11, color: Colors.grey[700], fontWeight: FontWeight.w500),
-                                ),
-                                Text(
-                                  "Conf: ${confidence != null ? confidence.toStringAsFixed(2) : '?'}%",
-                                  style: TextStyle(fontSize: 11, color: Colors.deepPurple[700], fontWeight: FontWeight.w600),
-                                ),
-                              ],
+                                      Flexible(
+                                        child: Text(
+                                          frameTime != null ? "Time: ${frameTime.toStringAsFixed(2)} s" : "",
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(fontSize: 11, color: Colors.grey[700], fontWeight: FontWeight.w500),
+                                        ),
+                                      ),
+                                      Flexible(
+                                        child: Text(
+                                          "Conf: ${confidence != null ? confidence.toStringAsFixed(2) : '?'}%",
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(fontSize: 11, color: Colors.deepPurple[700], fontWeight: FontWeight.w600),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                },
+                              ),
                             );
                           },
-                          separatorBuilder: (_, __) => SizedBox(width: 8),
+
                         ),
                       ),
                     ],
@@ -571,48 +720,77 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                       Row(
                         children: [
                           Image.asset('assets/images/crop.png', height: 24),
-                          SizedBox(width: 7),
-                          Text("Face Cropped Frames", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                          const SizedBox(width: 7),
+                          const Text("Face Cropped Frames", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                          const Spacer(),
+                          Tooltip(
+                            message: 'Rotate faces (90°)',
+                            child: InkWell(
+                              onTap: _rotateFaces,
+                              borderRadius: BorderRadius.circular(20),
+                              child: Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.circular(16),
+                                  boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 6)],
+                                ),
+                                child: const Icon(Icons.rotate_90_degrees_ccw, size: 18, color: Color(0xFF8E44AD)),
+                              ),
+                            ),
+                          ),
                         ],
                       ),
-                      SizedBox(height: 12),
+                      const SizedBox(height: 12),
                       SizedBox(
-                        height: 90,
+                        // hauteur dynamique selon rotation
+                        height: (_facesQuarterTurns % 2 == 1) ? 120 : 100,
                         child: ListView.separated(
                           scrollDirection: Axis.horizontal,
                           itemCount: _result!['cropped_faces'].length,
+                          separatorBuilder: (_, __) => const SizedBox(width: 7),
                           itemBuilder: (context, idx) {
                             final cropped = _result!['cropped_faces'][idx];
-                            final croppedUrl = "http://10.0.2.2:8000${cropped['url']}";
-                            return ClipRRect(
-                              borderRadius: BorderRadius.circular(10),
-                              child: Image.network(
-                                croppedUrl,
-                                width: 90,
-                                height: 90,
-                                fit: BoxFit.cover,
-                                errorBuilder: (context, error, stack) => Container(
-                                  width: 90,
-                                  height: 90,
-                                  color: Colors.grey[300],
-                                  child: Icon(Icons.broken_image, color: Colors.grey[700]),
+                            final croppedUrl = _absUrl(cropped['url']);
+                            return Builder(builder: (context) {
+                              final isOdd = (_facesQuarterTurns % 2) == 1;
+                              final thumbW = isOdd ? 70.0 : 90.0;
+                              final thumbH = isOdd ? 90.0 : 70.0;
+
+                              return ClipRRect(
+                                borderRadius: BorderRadius.circular(10),
+                                child: RotatedBox(
+                                  quarterTurns: _facesQuarterTurns,
+                                  child: Image.network(
+                                    croppedUrl,
+                                    width: thumbW,
+                                    height: thumbH,
+                                    fit: BoxFit.cover,
+                                    gaplessPlayback: true,
+                                    errorBuilder: (context, error, stack) => Container(
+                                      width: thumbW,
+                                      height: thumbH,
+                                      color: Colors.grey[300],
+                                      child: Icon(Icons.broken_image, color: Colors.grey[700]),
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            );
+                              );
+                            });
                           },
-                          separatorBuilder: (_, __) => SizedBox(width: 7),
                         ),
                       ),
+                      const SizedBox(height: 8),
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton.icon(
-                          icon: Icon(Icons.download),
-                          label: Text("Export CSV"),
+                          icon: const Icon(Icons.download),
+                          label: const Text("Export CSV"),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.blue[700],
                             foregroundColor: Colors.white,
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                            padding: EdgeInsets.symmetric(vertical: 10),
+                            padding: const EdgeInsets.symmetric(vertical: 10),
                           ),
                           onPressed: _exportCsvForSplitFrames,
                         ),
@@ -628,13 +806,13 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                       alignment: Alignment.centerLeft,
                       child: Container(
                         decoration: BoxDecoration(
-                          color: Color(0xFFF5FAFF), // fond bleu très pâle
+                          color: const Color(0xFFF5FAFF),
                           borderRadius: BorderRadius.circular(16),
                           boxShadow: [
                             BoxShadow(
                               color: Colors.blueGrey.withOpacity(0.09),
                               blurRadius: 12,
-                              offset: Offset(0, 4),
+                              offset: const Offset(0, 4),
                             ),
                           ],
                         ),
@@ -645,7 +823,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                             Row(
                               children: [
                                 Icon(Icons.info_outline, color: Colors.blue[400], size: 19),
-                                SizedBox(width: 8),
+                                const SizedBox(width: 8),
                                 Text(
                                   "Metadata",
                                   style: TextStyle(
@@ -671,9 +849,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                     alignment: Alignment.centerLeft,
                     child: Container(
                       decoration: BoxDecoration(
-                        color: _result!['result'] == 'REAL'
-                            ? Color(0xFFE7FEE7)
-                            : Color(0xFFFFEBEE),
+                        color: _result!['result'] == 'REAL' ? const Color(0xFFE7FEE7) : const Color(0xFFFFEBEE),
                         borderRadius: BorderRadius.circular(16),
                         boxShadow: [
                           BoxShadow(
@@ -681,7 +857,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                                 ? Colors.greenAccent.withOpacity(0.07)
                                 : Colors.redAccent.withOpacity(0.08)),
                             blurRadius: 11,
-                            offset: Offset(0, 4),
+                            offset: const Offset(0, 4),
                           )
                         ],
                       ),
@@ -712,7 +888,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                                 const SizedBox(height: 4),
                                 Text(
                                   "Confidence: ${_result!['confidence']?.toStringAsFixed(2) ?? '?'}%",
-                                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
                                 ),
                                 if (_result!['filename'] != null)
                                   Text("File: ${_result!['filename']}", style: const TextStyle(fontWeight: FontWeight.bold)),
@@ -739,12 +915,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
         height: 80.0,
         decoration: BoxDecoration(
           color: Colors.white,
-          border: Border(
-            top: BorderSide(
-              color: Colors.grey[300]!,
-              width: 1.0,
-            ),
-          ),
+          border: Border(top: BorderSide(color: Colors.grey[300]!, width: 1.0)),
         ),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
@@ -759,7 +930,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(Icons.home_outlined, color: Colors.grey[700], size: 24.0),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 4),
                     Text('Home', style: TextStyle(color: Colors.grey[700], fontSize: 10.0)),
                   ],
                 ),
@@ -771,7 +942,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(Icons.bar_chart_outlined, color: Colors.grey[700], size: 24.0),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 4),
                     Text('Statistics', style: TextStyle(color: Colors.grey[700], fontSize: 10.0)),
                   ],
                 ),
@@ -784,18 +955,11 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   decoration: BoxDecoration(
                     color: const Color(0xFF8E44AD),
                     shape: BoxShape.circle,
-                    border: Border.all(
-                      color: Colors.white,
-                      width: 3.0,
-                    ),
+                    border: Border.all(color: Colors.white, width: 3.0),
                   ),
                   child: const Align(
                     alignment: AlignmentDirectional(0.0, 0.0),
-                    child: Icon(
-                      Icons.psychology_alt_rounded,
-                      color: Colors.white,
-                      size: 28.0,
-                    ),
+                    child: Icon(Icons.psychology_alt_rounded, color: Colors.white, size: 28.0),
                   ),
                 ),
               ),
@@ -806,7 +970,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(Icons.history_outlined, color: Colors.grey[700], size: 24.0),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 4),
                     Text('History', style: TextStyle(color: Colors.grey[700], fontSize: 10.0)),
                   ],
                 ),
@@ -818,7 +982,7 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(Icons.person_outline, color: Colors.grey[700], size: 24.0),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 4),
                     Text('Profile', style: TextStyle(color: Colors.grey[700], fontSize: 10.0)),
                   ],
                 ),
@@ -829,9 +993,4 @@ class _AnalyzeScreenWidgetState extends State<AnalyzeScreenWidget> {
       ),
     );
   }
-
 }
-
-
-
-
