@@ -43,8 +43,9 @@ The repository was originally linked to the author’s Firebase project. Follow 
 - Enable Google.
 
 ### 3 - Register your apps:
-Android: add your package name (e.g., com.example.deepfake), and add SHA‑1 fingerprint (via ./android/gradlew signingReport or Play Console).
-download google-services.json from Firebase console → place it at android/app/google-services.json. Ensure com.google.gms.google-services Gradle plugin is applied in android/build.gradle and android/app/build.gradle.
+- Android: add your package name (e.g., com.example.deepfake), and add SHA‑1 fingerprint (via ./android/gradlew signingReport or Play Console).
+
+-download google-services.json from Firebase console → place it at android/app/google-services.json. Ensure com.google.gms.google-services Gradle plugin is applied in android/build.gradle and android/app/build.gradle.
 
 
 ## 5) Before launch the front
